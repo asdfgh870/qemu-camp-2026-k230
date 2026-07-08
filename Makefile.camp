@@ -1,0 +1,107 @@
+# Makefile.camp - K230 SoC Development Build System
+#
+# Usage: make -f Makefile.camp [target]
+#
+# Focus: K230 SoC development (hw/riscv/k230.c)
+#   - K230 SoC: RISC-V board compatible with Kendryte K230 SDK
+#   - Watchdog: hw/watchdog/k230_wdt.c
+#   - Tests: tests/qtest/k230-wdt-test.c
+
+SHELL := bash -o pipefail
+MAKEFLAGS += -rR
+
+SRC_DIR   := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
+BUILD_DIR := $(SRC_DIR)/build
+
+CROSS_PREFIX ?= riscv64-unknown-elf-
+
+CONFIGURE_FLAGS := \
+    --target-list=riscv64-softmmu \
+    --extra-cflags='-O0 -g3' \
+    --cross-prefix-riscv64=$(CROSS_PREFIX) \
+    --disable-docs \
+	--enable-debug \
+	--enable-slirp
+
+NPROC := $(shell nproc 2>/dev/null || echo 4)
+JOBS  ?= $(NPROC)
+
+MESON = $(BUILD_DIR)/pyvenv/bin/meson
+
+.PHONY: help
+help:
+	@echo "K230 SoC Development Build System"
+	@echo ""
+	@echo "Usage: make -f Makefile.camp <target>"
+	@echo ""
+	@echo "Build targets:"
+	@echo "  configure          Configure QEMU (riscv64-softmmu)"
+	@echo "  build              Build QEMU"
+	@echo "  rebuild            Clean and rebuild QEMU"
+	@echo ""
+	@echo "Test targets:"
+	@echo "  test               Run all K230 tests"
+	@echo "  test-k230-wdt      Run K230 watchdog tests (QTest)"
+	@echo ""
+	@echo "Run targets:"
+	@echo "  run                Run K230 machine (quick test)"
+	@echo ""
+	@echo "Clean targets:"
+	@echo "  clean              Clean build artifacts"
+	@echo "  distclean          Remove build directory entirely"
+	@echo ""
+	@echo "Options:"
+	@echo "  JOBS=N             Parallel jobs (default: $(NPROC))"
+	@echo "  CROSS_PREFIX=...   RISC-V cross compiler prefix"
+	@echo "                     (default: riscv64-unknown-elf-)"
+	@echo "  V=1                Verbose output"
+
+.PHONY: configure
+configure:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(SRC_DIR)/configure $(CONFIGURE_FLAGS)
+	@echo "--- Configure done ---"
+
+$(BUILD_DIR)/config-host.mak:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) configure
+
+.PHONY: build
+build: $(BUILD_DIR)/config-host.mak
+	$(MAKE) -C $(BUILD_DIR) -j$(JOBS)
+	@echo "--- Build done ---"
+
+.PHONY: rebuild
+rebuild: clean build
+
+.PHONY: test-k230-wdt
+test-k230-wdt: build
+	@passed=0; total=0; \
+	for t in "register_read_write" "counter_restart" "interrupt_mode" \
+	         "reset_mode" "timeout_calculation" "wdt1_registers" "enable_disable"; do \
+	    total=$$((total + 1)); \
+	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild --print-errorlogs \
+	        "qtest-riscv64/k230-wdt-test" --test-args="/k230-wdt/$$t" 2>/dev/null; then \
+	        passed=$$((passed + 1)); \
+	    fi; \
+	done; \
+	echo "--- K230 WDT tests: $$passed/$$total passed ---"
+
+.PHONY: test
+test: test-k230-wdt
+	@echo "=== All K230 tests done ==="
+
+.PHONY: run
+run: build
+	@echo "Running K230 machine (quick test)... Press Ctrl+C to exit"
+	$(BUILD_DIR)/qemu-system-riscv64 -machine k230 -nographic -monitor none -serial mon:stdio 2>&1 | head -20 || true
+	@echo "--- Run test done ---"
+
+.PHONY: clean
+clean:
+	@if [ -d $(BUILD_DIR) ] && [ -f $(BUILD_DIR)/build.ninja ]; then \
+	    $(MAKE) -C $(BUILD_DIR) clean; \
+	fi
+
+.PHONY: distclean
+distclean:
+	rm -rf $(BUILD_DIR) $(SRC_DIR)/GNUmakefile
