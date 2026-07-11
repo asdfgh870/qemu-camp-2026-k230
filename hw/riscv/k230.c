@@ -110,6 +110,7 @@ static void k230_soc_init(Object *obj)
     object_initialize_child(obj, "c908-cpu", cpu0, TYPE_RISCV_HART_ARRAY);
     object_initialize_child(obj, "k230-wdt0", &s->wdt[0], TYPE_K230_WDT);
     object_initialize_child(obj, "k230-wdt1", &s->wdt[1], TYPE_K230_WDT);
+    object_initialize_child(obj, "k230-spi", &s->spi, TYPE_K230_SPI);
 
     qdev_prop_set_uint32(DEVICE(cpu0), "hartid-base", 0);
     qdev_prop_set_string(DEVICE(cpu0), "cpu-type", TYPE_RISCV_CPU_THEAD_C908);
@@ -205,6 +206,12 @@ static void k230_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt[1]), 0, memmap[K230_DEV_WDT1].base);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->wdt[1]), 0,
                        qdev_get_gpio_in(DEVICE(s->c908_plic), K230_WDT1_IRQ));
+
+    sysbus_realize(SYS_BUS_DEVICE(&s->spi), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi), 0, memmap[K230_DEV_SPI].base);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi), 1, memmap[K230_DEV_FLASH].base);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi), 0,
+                       qdev_get_gpio_in(DEVICE(s->c908_plic), 130));
 
     /* unimplemented devices */
     create_unimplemented_device("kpu.l2-cache",
@@ -355,8 +362,7 @@ static void k230_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("qspi1", memmap[K230_DEV_QSPI1].base,
                                 memmap[K230_DEV_QSPI1].size);
 
-    create_unimplemented_device("spi", memmap[K230_DEV_SPI].base,
-                                memmap[K230_DEV_SPI].size);
+    
 
     create_unimplemented_device("hi_sys_cfg", memmap[K230_DEV_HI_SYS_CFG].base,
                                 memmap[K230_DEV_HI_SYS_CFG].size);
@@ -364,8 +370,7 @@ static void k230_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("ddrc_cfg", memmap[K230_DEV_DDRC_CFG].base,
                                 memmap[K230_DEV_DDRC_CFG].size);
 
-    create_unimplemented_device("flash", memmap[K230_DEV_FLASH].base,
-                                memmap[K230_DEV_FLASH].size);
+    
 }
 
 static void k230_soc_class_init(ObjectClass *oc, const void *data)
