@@ -1,5 +1,5 @@
 /*
- * K230 SPI (Octal SPI) Controller
+ * K230 SPI (Flash Memory Controller - Cadence SSIC)
  *
  * K230 Technical Reference Manual V0.3.1 (2024-11-18):
  * https://github.com/revyos/external-docs/blob/master/K230/en-us/K230_Technical_Reference_Manual_V0.3.1_20241118.pdf
@@ -20,70 +20,73 @@
 #include "migration/vmstate.h"
 
 #define DEFAULT_FLASH_SIZE (16 * 1024 * 1024)
+#define FIFO_DEPTH 256
+
+static void k230_spi_update_status(K230SpiState *s);
+static void k230_spi_set_irq(K230SpiState *s);
+static void k230_spi_do_xip_read(K230SpiState *s, uint32_t addr, uint32_t len);
 
 static void k230_spi_reset(DeviceState *dev)
 {
     K230SpiState *s = K230_SPI(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
-    s->regs[K230_SPI_CTRL / 4] = 0;
-    s->regs[K230_SPI_READ_CFG / 4] = 0x6B;
-    s->regs[K230_SPI_WRITE_CFG / 4] = 0x02;
-    s->regs[K230_SPI_DEV_SIZE / 4] = (1 << 4) | (256 << 4) | (4096 << 12) | (3 << 20);
-    s->regs[K230_SPI_VERSION / 4] = 0x30000001;
+    s->regs[K230_SPI_CTRLR0 / 4] = 0x00004007;
+    s->regs[K230_SPI_SR / 4] = 0x00000006;
+    s->regs[K230_SPI_IMR / 4] = 0x0000003f;
+    s->regs[K230_SPI_SPI_CTRLR0 / 4] = 0x28000200;
+    s->regs[K230_SPI_SSIC_VERSION_ID / 4] = 0x3130332a;
+    s->regs[K230_SPI_IDR / 4] = 0xa1b2c3d5;
 
     fifo8_reset(&s->rx_fifo);
     fifo8_reset(&s->tx_fifo);
 
     s->xip_enabled = false;
-    s->direct_access_enabled = false;
+    s->ssi_enabled = false;
 }
 
-static void k230_spi_set_irq(K230SpiState *s, uint32_t mask)
+static void k230_spi_update_status(K230SpiState *s)
 {
-    s->regs[K230_SPI_IRQ_STATUS / 4] |= s->regs[K230_SPI_IRQ_MASK / 4] & mask;
-    qemu_set_irq(s->irq, !!(s->regs[K230_SPI_IRQ_STATUS / 4] &
-                           s->regs[K230_SPI_IRQ_MASK / 4]));
-}
+    uint32_t sr = 0;
 
-static uint32_t k230_spi_get_addr_bytes(K230SpiState *s)
-{
-    return extract32(s->regs[K230_SPI_DEV_SIZE / 4], 20, 2) + 1;
-}
-
-static uint8_t k230_spi_get_rd_opcode(K230SpiState *s)
-{
-    return extract32(s->regs[K230_SPI_READ_CFG / 4], 0, 8);
-}
-
-static uint8_t k230_spi_get_wr_opcode(K230SpiState *s)
-{
-    return extract32(s->regs[K230_SPI_WRITE_CFG / 4], 0, 8);
-}
-
-static void k230_spi_tx_fifo_push_addr(K230SpiState *s, uint32_t addr)
-{
-    int addr_bytes = k230_spi_get_addr_bytes(s);
-
-    if (addr_bytes == 4) {
-        fifo8_push(&s->tx_fifo, addr >> 24);
+    if (fifo8_is_empty(&s->tx_fifo)) {
+        sr |= K230_SPI_SR_TFE;
     }
-    if (addr_bytes >= 3) {
-        fifo8_push(&s->tx_fifo, addr >> 16);
+    if (!fifo8_is_full(&s->tx_fifo)) {
+        sr |= K230_SPI_SR_TNF;
     }
-    if (addr_bytes >= 2) {
-        fifo8_push(&s->tx_fifo, addr >> 8);
+    if (!fifo8_is_empty(&s->rx_fifo)) {
+        sr |= K230_SPI_SR_RNE;
     }
-    fifo8_push(&s->tx_fifo, addr);
+    if (fifo8_is_full(&s->rx_fifo)) {
+        sr |= K230_SPI_SR_RFF;
+    }
+
+    s->regs[K230_SPI_SR / 4] = sr;
+    s->regs[K230_SPI_TXFLR / 4] = fifo8_num_used(&s->tx_fifo);
+    s->regs[K230_SPI_RXFLR / 4] = fifo8_num_used(&s->rx_fifo);
 }
 
-static void k230_spi_flush_txfifo(K230SpiState *s)
+static void k230_spi_set_irq(K230SpiState *s)
 {
-    while (!fifo8_is_empty(&s->tx_fifo)) {
-        uint32_t tx_rx = fifo8_pop(&s->tx_fifo);
-        tx_rx = ssi_transfer(s->spi, tx_rx);
-        fifo8_push(&s->rx_fifo, tx_rx);
-    }
+    uint32_t imr = s->regs[K230_SPI_IMR / 4];
+    uint32_t isr = s->regs[K230_SPI_ISR / 4];
+
+    qemu_set_irq(s->irq, !!(isr & imr));
+}
+
+static void k230_spi_clear_interrupt(K230SpiState *s, uint32_t mask)
+{
+    s->regs[K230_SPI_RISR / 4] &= ~mask;
+    s->regs[K230_SPI_ISR / 4] &= ~mask;
+    k230_spi_set_irq(s);
+}
+
+static void k230_spi_trigger_interrupt(K230SpiState *s, uint32_t mask)
+{
+    s->regs[K230_SPI_RISR / 4] |= mask;
+    s->regs[K230_SPI_ISR / 4] |= mask;
+    k230_spi_set_irq(s);
 }
 
 static void k230_spi_select_cs(K230SpiState *s, bool select)
@@ -91,58 +94,86 @@ static void k230_spi_select_cs(K230SpiState *s, bool select)
     qemu_set_irq(s->cs_line, !select);
 }
 
-static void k230_spi_do_read(K230SpiState *s, uint32_t addr, uint32_t len)
+static void k230_spi_do_transfer(K230SpiState *s)
 {
-    uint8_t opcode = k230_spi_get_rd_opcode(s);
-    int dummy_cycles = extract32(s->regs[K230_SPI_READ_CFG / 4], 16, 5);
-    int i;
-
-    fifo8_reset(&s->tx_fifo);
-    fifo8_reset(&s->rx_fifo);
-
-    fifo8_push(&s->tx_fifo, opcode);
-    k230_spi_tx_fifo_push_addr(s, addr);
-
-    for (i = 0; i < dummy_cycles; i++) {
-        fifo8_push(&s->tx_fifo, 0);
+    if (!s->ssi_enabled) {
+        return;
     }
 
-    k230_spi_select_cs(s, true);
-    k230_spi_flush_txfifo(s);
+    uint32_t ctrlr0 = s->regs[K230_SPI_CTRLR0 / 4];
+    uint32_t frf_ssic = extract32(ctrlr0, 11, 2);
+    uint32_t dfs = extract32(ctrlr0, 0, 5);
+    uint32_t tmod = extract32(ctrlr0, 7, 2);
 
-    fifo8_reset(&s->rx_fifo);
-    for (i = 0; i < len; i++) {
-        fifo8_push(&s->tx_fifo, 0);
+    uint32_t ndf = s->regs[K230_SPI_CTRLR1 / 4] & 0xffff;
+    uint32_t total_frames = ndf + 1;
+
+    k230_spi_select_cs(s, true);
+
+    while (total_frames > 0 && !fifo8_is_empty(&s->tx_fifo)) {
+        uint32_t tx_data = fifo8_pop(&s->tx_fifo);
+
+        if (frf_ssic == K230_SPI_CTRLR0_FRF_SPI_STD) {
+            uint32_t rx_data = ssi_transfer(s->spi, tx_data);
+            if (tmod != K230_SPI_CTRLR0_TMOD_TO) {
+                if (!fifo8_is_full(&s->rx_fifo)) {
+                    fifo8_push(&s->rx_fifo, rx_data);
+                } else {
+                    k230_spi_trigger_interrupt(s, K230_SPI_ISR_RXOIS);
+                }
+            }
+        } else {
+            int bits_per_frame = dfs + 1;
+            int bytes_per_frame = (bits_per_frame + 7) / 8;
+
+            uint8_t tx_buf[8] = {};
+            uint8_t rx_buf[8] = {};
+
+            tx_buf[0] = tx_data;
+            if (bytes_per_frame > 1) {
+                tx_buf[1] = tx_data >> 8;
+            }
+            if (bytes_per_frame > 2) {
+                tx_buf[2] = tx_data >> 16;
+            }
+            if (bytes_per_frame > 3) {
+                tx_buf[3] = tx_data >> 24;
+            }
+
+            for (int i = 0; i < bytes_per_frame; i++) {
+                rx_buf[i] = ssi_transfer(s->spi, tx_buf[i]);
+            }
+
+            if (tmod != K230_SPI_CTRLR0_TMOD_TO) {
+                uint32_t rx_data = rx_buf[0];
+                if (bytes_per_frame > 1) {
+                    rx_data |= (uint32_t)rx_buf[1] << 8;
+                }
+                if (bytes_per_frame > 2) {
+                    rx_data |= (uint32_t)rx_buf[2] << 16;
+                }
+                if (bytes_per_frame > 3) {
+                    rx_data |= (uint32_t)rx_buf[3] << 24;
+                }
+
+                if (!fifo8_is_full(&s->rx_fifo)) {
+                    fifo8_push(&s->rx_fifo, rx_data);
+                } else {
+                    k230_spi_trigger_interrupt(s, K230_SPI_ISR_RXOIS);
+                }
+            }
+        }
+
+        total_frames--;
     }
-    k230_spi_flush_txfifo(s);
 
     k230_spi_select_cs(s, false);
-}
+    k230_spi_update_status(s);
 
-static void k230_spi_do_write(K230SpiState *s, uint32_t addr, const uint8_t *data, uint32_t len)
-{
-    uint8_t opcode = k230_spi_get_wr_opcode(s);
-    int i;
-
-    fifo8_reset(&s->tx_fifo);
-    fifo8_reset(&s->rx_fifo);
-
-    fifo8_push(&s->tx_fifo, 0x06);
-    k230_spi_select_cs(s, true);
-    k230_spi_flush_txfifo(s);
-    k230_spi_select_cs(s, false);
-
-    fifo8_reset(&s->tx_fifo);
-    fifo8_push(&s->tx_fifo, opcode);
-    k230_spi_tx_fifo_push_addr(s, addr);
-
-    for (i = 0; i < len; i++) {
-        fifo8_push(&s->tx_fifo, data[i]);
+    uint32_t rx_thres = s->regs[K230_SPI_RXFTLR / 4] & 0xff;
+    if (fifo8_num_used(&s->rx_fifo) >= rx_thres) {
+        k230_spi_trigger_interrupt(s, K230_SPI_ISR_RXFI);
     }
-
-    k230_spi_select_cs(s, true);
-    k230_spi_flush_txfifo(s);
-    k230_spi_select_cs(s, false);
 }
 
 static uint64_t k230_spi_reg_read(void *opaque, hwaddr addr, unsigned int size)
@@ -154,76 +185,16 @@ static uint64_t k230_spi_reg_read(void *opaque, hwaddr addr, unsigned int size)
         return 0;
     }
 
+    if (addr >= K230_SPI_DR && addr < K230_SPI_DR + 0x20) {
+        if (!fifo8_is_empty(&s->rx_fifo)) {
+            uint32_t data = fifo8_pop(&s->rx_fifo);
+            k230_spi_update_status(s);
+            return data;
+        }
+        return 0;
+    }
+
     return s->regs[reg_addr];
-}
-
-static void k230_spi_stig_exec(K230SpiState *s)
-{
-    uint8_t opcode = s->regs[K230_SPI_STIG_OPCODE / 4];
-    uint32_t addr = s->regs[K230_SPI_STIG_ADDR / 4];
-    bool en_addr = extract32(s->regs[K230_SPI_STIG_CTRL / 4], 1, 1);
-    bool en_rd_data = extract32(s->regs[K230_SPI_STIG_CTRL / 4], 2, 1);
-    bool en_wr_data = extract32(s->regs[K230_SPI_STIG_CTRL / 4], 3, 1);
-    uint64_t wr_data = ((uint64_t)s->regs[K230_SPI_STIG_DATA_HIGH / 4] << 32) |
-                       s->regs[K230_SPI_STIG_DATA_LOW / 4];
-    uint8_t data[8] = {};
-    int i;
-
-    fifo8_reset(&s->tx_fifo);
-    fifo8_reset(&s->rx_fifo);
-
-    fifo8_push(&s->tx_fifo, opcode);
-
-    if (en_addr) {
-        k230_spi_tx_fifo_push_addr(s, addr);
-    }
-
-    if (en_wr_data) {
-        for (i = 0; i < 8; i++) {
-            fifo8_push(&s->tx_fifo, wr_data >> (i * 8));
-        }
-    }
-
-    k230_spi_select_cs(s, true);
-
-    if (en_rd_data) {
-        k230_spi_flush_txfifo(s);
-        fifo8_reset(&s->rx_fifo);
-        for (i = 0; i < 8; i++) {
-            fifo8_push(&s->tx_fifo, 0);
-        }
-        k230_spi_flush_txfifo(s);
-
-        for (i = 0; i < 8; i++) {
-            data[i] = fifo8_pop(&s->rx_fifo);
-        }
-
-        s->regs[K230_SPI_STIG_DATA_LOW / 4] = ldl_le_p(data);
-        s->regs[K230_SPI_STIG_DATA_HIGH / 4] = ldl_le_p(data + 4);
-    } else {
-        k230_spi_flush_txfifo(s);
-    }
-
-    k230_spi_select_cs(s, false);
-
-    s->regs[K230_SPI_STIG_CTRL / 4] &= ~K230_SPI_STIG_CTRL_EXEC;
-    k230_spi_set_irq(s, K230_SPI_IRQ_STATUS_STIG_DONE);
-}
-
-static void k230_spi_ind_exec(K230SpiState *s)
-{
-    uint32_t addr = s->regs[K230_SPI_IND_START_ADDR / 4];
-    uint32_t num_bytes = s->regs[K230_SPI_IND_NUM_BYTES / 4];
-
-    s->regs[K230_SPI_IND_CTRL / 4] |= K230_SPI_IND_CTRL_BUSY;
-
-    k230_spi_do_read(s, addr, num_bytes);
-
-    s->regs[K230_SPI_IND_CTRL / 4] &= ~K230_SPI_IND_CTRL_BUSY;
-    s->regs[K230_SPI_IND_CTRL / 4] |= K230_SPI_IND_CTRL_DONE;
-    s->regs[K230_SPI_IND_CTRL / 4] &= ~K230_SPI_IND_CTRL_START;
-
-    k230_spi_set_irq(s, K230_SPI_IRQ_STATUS_IND_DONE);
 }
 
 static void k230_spi_reg_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
@@ -235,37 +206,73 @@ static void k230_spi_reg_write(void *opaque, hwaddr addr, uint64_t value, unsign
         return;
     }
 
+    if (!s->ssi_enabled && addr != K230_SPI_SSIENR && addr != K230_SPI_SSI_CTRL) {
+        return;
+    }
+
     switch (addr) {
-    case K230_SPI_CTRL:
+    case K230_SPI_SSIENR:
+        s->ssi_enabled = value & K230_SPI_SSIENR_SSI_EN;
         s->regs[reg_addr] = value;
-        s->xip_enabled = extract32(value, 1, 1);
-        s->direct_access_enabled = extract32(value, 2, 1);
         break;
 
-    case K230_SPI_IND_CTRL:
-        s->regs[reg_addr] = value & ~(K230_SPI_IND_CTRL_BUSY | K230_SPI_IND_CTRL_DONE);
-        if (value & K230_SPI_IND_CTRL_START) {
-            k230_spi_ind_exec(s);
-        }
-        if (value & K230_SPI_IND_CTRL_CANCEL) {
-            s->regs[reg_addr] &= ~K230_SPI_IND_CTRL_CANCEL;
-            s->regs[reg_addr] &= ~K230_SPI_IND_CTRL_BUSY;
+    case K230_SPI_SSI_CTRL:
+        if (value & K230_SPI_SSI_CTRL_SOFT_RST) {
+            k230_spi_reset(DEVICE(s));
         }
         break;
 
-    case K230_SPI_STIG_CTRL:
+    case K230_SPI_TXEICR:
+        if (value & K230_SPI_TXEICR_TXEIC) {
+            k230_spi_clear_interrupt(s, K230_SPI_ISR_TXEIS);
+        }
+        break;
+
+    case K230_SPI_RXOICR:
+        if (value & K230_SPI_RXOICR_RXOIC) {
+            k230_spi_clear_interrupt(s, K230_SPI_ISR_RXOIS);
+        }
+        break;
+
+    case K230_SPI_RXUICR:
+        if (value & K230_SPI_RXUICR_RXUIC) {
+            k230_spi_clear_interrupt(s, K230_SPI_ISR_RXUIS);
+        }
+        break;
+
+    case K230_SPI_MSTICR:
+        if (value & K230_SPI_MSTICR_MSTIC) {
+            k230_spi_clear_interrupt(s, K230_SPI_ISR_MSTIS);
+        }
+        break;
+
+    case K230_SPI_ICR:
+        if (value & K230_SPI_ICR_ALLIC) {
+            k230_spi_clear_interrupt(s, 0x3f);
+        }
+        break;
+
+    case K230_SPI_SPI_CTRLR0:
         s->regs[reg_addr] = value;
-        if (value & K230_SPI_STIG_CTRL_EXEC) {
-            k230_spi_stig_exec(s);
-        }
-        break;
-
-    case K230_SPI_IRQ_STATUS:
-        s->regs[reg_addr] &= ~value;
-        k230_spi_set_irq(s, 0);
+        s->xip_enabled = extract32(value, 5, 1);
         break;
 
     default:
+        if (addr >= K230_SPI_DR && addr < K230_SPI_DR + 0x20) {
+            if (!fifo8_is_full(&s->tx_fifo)) {
+                fifo8_push(&s->tx_fifo, value);
+                k230_spi_update_status(s);
+
+                uint32_t tmod = extract32(s->regs[K230_SPI_CTRLR0 / 4], 7, 2);
+                if (tmod != K230_SPI_CTRLR0_TMOD_EP) {
+                    k230_spi_do_transfer(s);
+                }
+            } else {
+                k230_spi_trigger_interrupt(s, K230_SPI_ISR_TXOIS);
+            }
+            return;
+        }
+
         s->regs[reg_addr] = value;
         break;
     }
@@ -282,24 +289,70 @@ static const MemoryRegionOps k230_spi_reg_ops = {
     },
 };
 
+static void k230_spi_do_xip_read(K230SpiState *s, uint32_t addr, uint32_t len)
+{
+    if (!s->ssi_enabled || !s->xip_enabled) {
+        return;
+    }
+
+    uint32_t spi_ctrlr0 = s->regs[K230_SPI_SPI_CTRLR0 / 4];
+    bool xip_inst_en = extract32(spi_ctrlr0, 5, 1);
+    bool xip_md_bit_en = extract32(spi_ctrlr0, 7, 1);
+    uint32_t inst_l = extract32(spi_ctrlr0, 8, 8);
+    uint32_t addr_l = extract32(spi_ctrlr0, 16, 8);
+
+    fifo8_reset(&s->tx_fifo);
+    fifo8_reset(&s->rx_fifo);
+
+    if (xip_inst_en) {
+        uint32_t incr_inst = s->regs[K230_SPI_XIP_INCR_INST / 4];
+        for (int i = 0; i < inst_l; i++) {
+            fifo8_push(&s->tx_fifo, incr_inst >> (i * 8));
+        }
+    }
+
+    int addr_bytes = (addr_l + 7) / 8;
+    if (addr_bytes == 4) {
+        fifo8_push(&s->tx_fifo, addr >> 24);
+    }
+    if (addr_bytes >= 3) {
+        fifo8_push(&s->tx_fifo, addr >> 16);
+    }
+    if (addr_bytes >= 2) {
+        fifo8_push(&s->tx_fifo, addr >> 8);
+    }
+    fifo8_push(&s->tx_fifo, addr);
+
+    if (xip_md_bit_en) {
+        uint32_t mode_bits = s->regs[K230_SPI_XIP_MODE_BITS / 4];
+        fifo8_push(&s->tx_fifo, mode_bits);
+    }
+
+    k230_spi_select_cs(s, true);
+    k230_spi_do_transfer(s);
+
+    fifo8_reset(&s->rx_fifo);
+    for (int i = 0; i < len; i++) {
+        fifo8_push(&s->tx_fifo, 0);
+    }
+    k230_spi_do_transfer(s);
+    k230_spi_select_cs(s, false);
+}
+
 static uint64_t k230_spi_xip_read(void *opaque, hwaddr addr, unsigned int size)
 {
     K230SpiState *s = K230_SPI(opaque);
 
-    if (!s->xip_enabled || !s->direct_access_enabled) {
+    if (!s->ssi_enabled || !s->xip_enabled) {
         qemu_log_mask(LOG_GUEST_ERROR, "K230 SPI XIP read while disabled\n");
         return 0;
-    }
-
-    if (s->regs[K230_SPI_CTRL / 4] & K230_SPI_CTRL_ADDR_REMAP) {
-        addr += s->regs[K230_SPI_REMAP_ADDR / 4];
     }
 
     if (addr >= s->flash_size) {
         return 0;
     }
 
-    k230_spi_do_read(s, addr, size);
+    k230_spi_do_xip_read(s, addr, size);
 
     uint64_t result = 0;
     for (int i = 0; i < size && !fifo8_is_empty(&s->rx_fifo); i++) {
@@ -313,25 +366,55 @@ static void k230_spi_xip_write(void *opaque, hwaddr addr, uint64_t value, unsign
 {
     K230SpiState *s = K230_SPI(opaque);
 
-    if (!s->xip_enabled || !s->direct_access_enabled) {
+    if (!s->ssi_enabled || !s->xip_enabled) {
         qemu_log_mask(LOG_GUEST_ERROR, "K230 SPI XIP write while disabled\n");
         return;
-    }
-
-    if (s->regs[K230_SPI_CTRL / 4] & K230_SPI_CTRL_ADDR_REMAP) {
-        addr += s->regs[K230_SPI_REMAP_ADDR / 4];
     }
 
     if (addr >= s->flash_size) {
         return;
     }
 
-    uint8_t data[8] = {};
-    for (int i = 0; i < size; i++) {
-        data[i] = value >> (i * 8);
+    uint32_t spi_ctrlr0 = s->regs[K230_SPI_SPI_CTRLR0 / 4];
+    bool xip_inst_en = extract32(spi_ctrlr0, 5, 1);
+    uint32_t inst_l = extract32(spi_ctrlr0, 8, 8);
+    uint32_t addr_l = extract32(spi_ctrlr0, 16, 8);
+
+    fifo8_reset(&s->tx_fifo);
+
+    fifo8_push(&s->tx_fifo, 0x06);
+    k230_spi_select_cs(s, true);
+    k230_spi_do_transfer(s);
+    k230_spi_select_cs(s, false);
+
+    fifo8_reset(&s->tx_fifo);
+
+    if (xip_inst_en) {
+        uint32_t write_incr_inst = s->regs[K230_SPI_XIP_WRITE_INCR_INST / 4];
+        for (int i = 0; i < inst_l; i++) {
+            fifo8_push(&s->tx_fifo, write_incr_inst >> (i * 8));
+        }
     }
 
-    k230_spi_do_write(s, addr, data, size);
+    int addr_bytes = (addr_l + 7) / 8;
+    if (addr_bytes == 4) {
+        fifo8_push(&s->tx_fifo, addr >> 24);
+    }
+    if (addr_bytes >= 3) {
+        fifo8_push(&s->tx_fifo, addr >> 16);
+    }
+    if (addr_bytes >= 2) {
+        fifo8_push(&s->tx_fifo, addr >> 8);
+    }
+    fifo8_push(&s->tx_fifo, addr);
+
+    for (int i = 0; i < size; i++) {
+        fifo8_push(&s->tx_fifo, value >> (i * 8));
+    }
+
+    k230_spi_select_cs(s, true);
+    k230_spi_do_transfer(s);
+    k230_spi_select_cs(s, false);
 }
 
 static const MemoryRegionOps k230_spi_xip_ops = {
@@ -348,8 +431,8 @@ static void k230_spi_realize(DeviceState *dev, Error **errp)
     s->spi = ssi_create_bus(dev, "spi");
     sysbus_init_irq(sbd, &s->cs_line);
 
-    fifo8_create(&s->rx_fifo, 256);
-    fifo8_create(&s->tx_fifo, 256);
+    fifo8_create(&s->rx_fifo, FIFO_DEPTH);
+    fifo8_create(&s->tx_fifo, FIFO_DEPTH);
 
     s->flash_size = DEFAULT_FLASH_SIZE;
 }
@@ -382,7 +465,7 @@ static void k230_spi_class_init(ObjectClass *klass, const void *data)
     dc->realize = k230_spi_realize;
     device_class_set_legacy_reset(dc, k230_spi_reset);
     dc->vmsd = &vmstate_k230_spi;
-    dc->desc = "K230 Octal SPI Controller";
+    dc->desc = "K230 Flash Memory Controller (Cadence SSIC)";
 }
 
 static const TypeInfo k230_spi_type_info = {
